@@ -145,6 +145,10 @@ class FileReceiver:
         self._file_obj = None
         self._progress = None
         self._path = path
+        self._done_promise = asyncio.get_event_loop().create_future()
+
+    async def wait_until_done(self):
+        await self._done_promise
 
     def set_channel(self, channel_type, channel):
         if channel_type == "file":
@@ -185,10 +189,11 @@ class FileReceiver:
                 if self._file_obj:
                     await self._file_obj.close()
                     self._file_obj = None
-                if compute_hash(self._path) == self._metadata["hash"]:
+                if compute_hash(self._location) == self._metadata["hash"]:
                     print("File received successfully")
                 else:
                     print("[ERROR} File corrupted")
+                self._done_promise.set_result(True)
         
 
 class Peer:
@@ -208,6 +213,10 @@ class Peer:
     async def start(self):
         await self.coro
         if isinstance(self.file_handler, FileSender):
+            print("Waiting for file transfer to finish...")
+            await self.file_handler.wait_until_done()
+        elif isinstance(self.file_handler, FileReceiver):
+            print("Waiting for file reception to finish...")
             await self.file_handler.wait_until_done()
 
     async def consume_signaling(self):
@@ -268,7 +277,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Data channel file transfer")
     parser.add_argument("role", choices=["send", "receive"])
     parser.add_argument("path")
+    parser.add_argument("--verbose", "-v", action="count")
 
     args = parser.parse_args()
+
+    if args.verbose:
+        logging.basicConfig(level=logging.DEBUG)
 
     asyncio.run(main())
