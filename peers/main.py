@@ -82,17 +82,25 @@ def compute_hash(file_path):
 
 
 class FileSender:
-    def __init__(self):
+    def __init__(self, file_path):
+        self._file_path = file_path
         self._file_channel = None
         self._control_channel = None
-        self._file_path = None
+        self._sending_task = None
 
     def set_channel(self, channel_type, channel):
         if channel_type == "file":
             self._file_channel = channel
-            self._file_channel.on("open", lambda: asyncio.create_task(self._start_file_transfer()))
+            self._file_channel.on("open", self._on_file_open)
         elif channel_type == "control":
             self._control_channel = channel
+
+    def _on_file_open(self):
+        self._sending_task = asyncio.create_task(self._start_file_transfer())
+
+    async def wait_until_done(self):
+        if self._sending_task:
+            await self._sending_task
 
     @staticmethod
     def _construct_metadata(file_path):
@@ -102,9 +110,6 @@ class FileSender:
             "hash": compute_hash(file_path)
         }
         return metadata
-
-    def start_sending(self, file_path):
-        self._file_path = file_path
 
     async def _start_file_transfer(self):
         if not self._control_channel or not self._file_channel or not self._file_path:
@@ -194,7 +199,7 @@ class Peer:
         self.pc = RTCPeerConnection(configuration=rtc_config)
 
         if role == "send":
-            self.file_handler = FileSender()
+            self.file_handler = FileSender(args.path)
             self.coro = self.run_offer()
         elif role == "receive":
             self.file_handler = FileReceiver(args.path)
@@ -203,7 +208,7 @@ class Peer:
     async def start(self):
         await self.coro
         if isinstance(self.file_handler, FileSender):
-            self.file_handler.start_sending(args.path)
+            await self.file_handler.wait_until_done()
 
     async def consume_signaling(self):
         obj = await self.signaling.receive()
