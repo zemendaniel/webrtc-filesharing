@@ -212,6 +212,7 @@ class Peer:
 
     async def start(self):
         await self.coro
+        task = asyncio.create_task(self.consume_signaling())  # keep listening
         if isinstance(self.file_handler, FileSender):
             print("Waiting for file transfer to finish...")
             await self.file_handler.wait_until_done()
@@ -220,17 +221,18 @@ class Peer:
             await self.file_handler.wait_until_done()
 
     async def consume_signaling(self):
-        obj = await self.signaling.receive()
+        while True:
+            obj = await self.signaling.receive()
 
-        if isinstance(obj, RTCSessionDescription):
-            await self.pc.setRemoteDescription(obj)
+            if isinstance(obj, RTCSessionDescription):
+                await self.pc.setRemoteDescription(obj)
 
-            if obj.type == "offer":
-                await self.pc.setLocalDescription(await self.pc.createAnswer())
-                await self.signaling.send(self.pc.localDescription)
+                if obj.type == "offer":
+                    await self.pc.setLocalDescription(await self.pc.createAnswer())
+                    await self.signaling.send(self.pc.localDescription)
 
-        elif isinstance(obj, RTCIceCandidate):
-            await self.pc.addIceCandidate(obj)
+            elif isinstance(obj, RTCIceCandidate):
+                await self.pc.addIceCandidate(obj)
 
     async def run_answer(self):
         """
