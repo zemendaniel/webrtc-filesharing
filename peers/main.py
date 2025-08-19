@@ -87,6 +87,7 @@ class FileSender:
         self._file_channel = None
         self._control_channel = None
         self._sending_task = None
+        self._done_promise = asyncio.get_event_loop().create_future()
 
     def set_channel(self, channel_type, channel):
         if channel_type == "file":
@@ -99,8 +100,7 @@ class FileSender:
         self._sending_task = asyncio.create_task(self._start_file_transfer())
 
     async def wait_until_done(self):
-        if self._sending_task:
-            await self._sending_task
+        await self._done_promise
 
     @staticmethod
     def _construct_metadata(file_path):
@@ -135,6 +135,7 @@ class FileSender:
 
         self._control_channel.send(ControlMessage.create_json("eof", metadata["file_name"]))
 
+        self._done_promise.set_result(None)
 
 class FileReceiver:
     def __init__(self, path):
