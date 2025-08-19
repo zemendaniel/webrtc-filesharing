@@ -7,6 +7,7 @@ import time
 import pickle
 from aiortc import RTCIceCandidate, RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer
 from aiortc.contrib.signaling import BYE, add_signaling_arguments, create_signaling
+import aioconsole
 
 
 class WebSocketSignaling:
@@ -30,11 +31,11 @@ class WebSocketSignaling:
 
 
 class Messaging:
-    def __init__(self):
+    def __init__(self, stop_event):
         self.chat_channel = None
         self.control_channel = None
         self.input_task = None
-        self.stop_event = asyncio.Event()
+        self.stop_event = stop_event
 
     def set_channel(self, channel_type, channel):
         if channel_type == "chat":
@@ -48,28 +49,21 @@ class Messaging:
         self.chat_channel.on("message", lambda msg: Messaging.__on_chat_message(msg))
         self.control_channel.on("message", lambda msg: self.__on_control_message(msg))
 
-        if self.chat_channel.readyState == "open":
-            self.input_task = asyncio.create_task(self.input_loop())
-        else:
-            self.chat_channel.on("open", self.__on_chat_open)
+        self.input_task = asyncio.create_task(self.__input_loop())
 
     @staticmethod
     def __on_chat_message(message: str):
-        print(f"<<< {message}")
+        print(f"<<< {message}\n")
 
-    def __on_chat_open(self):
-        print("Type messages below...")
-        asyncio.create_task(self.input_loop())
-
-    async def input_loop(self):
-        loop = asyncio.get_running_loop()
+    async def __input_loop(self):
+        print("Type message to send or /close to close the channel")
         try:
             while not self.stop_event.is_set():
-                msg = await loop.run_in_executor(None, input, ">>> ")
+                msg = await aioconsole.ainput(">>> ")
                 if msg == "/close":
                     if self.control_channel.readyState == "open":
-                        self.control_channel.send("close")
-                    self.chat_channel.close()
+                        await self.control_channel.send("close")
+                    await self.chat_channel.close()
                     print("[You have closed the channel]")
                     self.stop_event.set()
                     break
@@ -89,62 +83,83 @@ class Messaging:
             self.stop_event.set()
 
 
-async def consume_signaling(pc, signaling):
-    try:
-        while True:
-            obj = await signaling.receive()
+class Peer:
+    def __init__(self, role):
+        self.signaling = WebSocketSignaling("ws://152.53.123.174:8001")
+        self.stop_event = asyncio.Event()
+        self.messaging = Messaging(stop_event=self.stop_event)
 
-            if isinstance(obj, RTCSessionDescription):
-                await pc.setRemoteDescription(obj)
+        ice_servers = [RTCIceServer(urls="stun:stun.l.google.com:19302")]
+        rtc_config = RTCConfiguration(iceServers=ice_servers)
+        self.pc = RTCPeerConnection(configuration=rtc_config)
 
-                if obj.type == "offer":
-                    await pc.setLocalDescription(await pc.createAnswer())
-                    await signaling.send(pc.localDescription)
+        if role == "send":
+            self.coro = self.run_offer()
+        elif role == "receive":
+            self.coro = self.run_answer()
 
-            elif isinstance(obj, RTCIceCandidate):
-                await pc.addIceCandidate(obj)
-    except asyncio.CancelledError:
-        pass
-    finally:
-        await pc.close()
-        await signaling.close()
+    async def start(self):
+        await self.coro
 
+    async def consume_signaling(self):
+        """
+        The main loop of the peer
+        """
+        try:
+            while not self.stop_event.is_set():
+                obj = await self.signaling.receive()
 
-async def run_answer(pc, signaling):
-    await signaling.connect()
+                if isinstance(obj, RTCSessionDescription):
+                    await self.pc.setRemoteDescription(obj)
 
-    @pc.on("datachannel")
-    def on_datachannel(channel):
-        if channel.label == "chat":
-            messaging.set_channel("chat", channel)
-        elif channel.label == "control":
-            messaging.set_channel("control", channel)
+                    if obj.type == "offer":
+                        await self.pc.setLocalDescription(await self.pc.createAnswer())
+                        await self.signaling.send(self.pc.localDescription)
 
-    await consume_signaling(pc, signaling)
+                elif isinstance(obj, RTCIceCandidate):
+                    await self.pc.addIceCandidate(obj)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await self.pc.close()
+            await self.signaling.close()
 
+    async def run_answer(self):
+        """
+        The receiver uses this function to receive the offer from the signaling server and start the loop
+        """
+        await self.signaling.connect()
 
-async def run_offer(pc, signaling):
-    global messaging
-    await signaling.connect()
+        @self.pc.on("datachannel")
+        def on_datachannel(channel):
+            if channel.label == "chat":
+                self.messaging.set_channel("chat", channel)
+            elif channel.label == "control":
+                self.messaging.set_channel("control", channel)
 
-    chat_channel = pc.createDataChannel("chat")
-    control_channel = pc.createDataChannel("control")
+        await self.consume_signaling()
 
-    messaging.set_channel("chat", chat_channel)
-    messaging.set_channel("control", control_channel)
+    async def run_offer(self):
+        """
+        The sender uses this function to send the offer to the signaling server and start the loop
+        """
+        await self.signaling.connect()
 
-    # send offer
-    await pc.setLocalDescription(await pc.createOffer())
-    await signaling.send(pc.localDescription)
+        chat_channel = self.pc.createDataChannel("chat")
+        control_channel = self.pc.createDataChannel("control")
 
-    await consume_signaling(pc, signaling)
+        self.messaging.set_channel("chat", chat_channel)
+        self.messaging.set_channel("control", control_channel)
+
+        await self.pc.setLocalDescription(await self.pc.createOffer())
+        await self.signaling.send(self.pc.localDescription)
+
+        await self.consume_signaling()
 
 
 async def main():
-    if args.role == "send":
-        await run_offer(pc, signaling)
-    elif args.role == "receive":
-        await run_answer(pc, signaling)
+    peer = Peer(args.role)
+    await peer.start()
 
 
 if __name__ == "__main__":
@@ -160,25 +175,19 @@ if __name__ == "__main__":
     if args.verbose:
         logging.basicConfig(level=logging.DEBUG)
 
-    signaling = WebSocketSignaling("ws://152.53.123.174:8001")
-    ice_servers = [RTCIceServer(urls="stun:stun.l.google.com:19302")]
-    rtc_config = RTCConfiguration(iceServers=ice_servers)
-    pc = RTCPeerConnection(configuration=rtc_config)
-    messaging = Messaging()
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    main_task = loop.create_task(main())
-    try:
-        loop.run_until_complete(main_task)
-    except KeyboardInterrupt:
-        messaging.stop_event.set()
-        if messaging.input_task:
-            messaging.input_task.cancel()
-        loop.run_until_complete(main_task)
-    finally:
-        if messaging.input_task:
-            messaging.input_task.cancel()
-        loop.run_until_complete(pc.close())
-        loop.run_until_complete(signaling.close())
-        loop.close()
+    # loop = asyncio.new_event_loop()
+    # asyncio.set_event_loop(loop)
+    asyncio.run(main())
+    # try:
+    #     loop.run_until_complete(main_task)
+    # except KeyboardInterrupt:
+    #     messaging.stop_event.set()
+    #     if messaging.input_task:
+    #         messaging.input_task.cancel()
+    #     loop.run_until_complete(main_task)
+    # finally:
+    #     if messaging.input_task:
+    #         messaging.input_task.cancel()
+    #     loop.run_until_complete(pc.close())
+    #     loop.run_until_complete(signaling.close())
+    #     loop.close()
