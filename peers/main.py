@@ -31,11 +31,15 @@ class WebSocketSignaling:
 
 
 class Messaging:
-    def __init__(self, stop_event):
+    def __init__(self, stop_event, on_close):
         self.chat_channel = None
         self.control_channel = None
         self.input_task = None
         self.stop_event = stop_event
+        self.on_close = on_close
+
+    def set_on_close(self, on_close):
+        self.on_close = on_close
 
     def set_channel(self, channel_type, channel):
         if channel_type == "chat":
@@ -49,7 +53,14 @@ class Messaging:
         self.chat_channel.on("message", lambda msg: Messaging.__on_chat_message(msg))
         self.control_channel.on("message", lambda msg: self.__on_control_message(msg))
 
-        self.input_task = asyncio.create_task(self.__input_loop())
+        if self.chat_channel.readyState == "open":
+            self.input_task = asyncio.create_task(self.__input_loop())
+        else:
+            self.chat_channel.on("open", self.__on_chat_open)
+
+    def __on_chat_open(self):
+        if not self.input_task:
+            self.input_task = asyncio.create_task(self.__input_loop())
 
     @staticmethod
     def __on_chat_message(message: str):
@@ -73,6 +84,8 @@ class Messaging:
                 else:
                     print("[The chanel got disconnected]")
                     self.stop_event.set()
+                    if self.on_close:
+                        await self.on_close()
                     break
         except asyncio.CancelledError:
             pass
@@ -84,12 +97,18 @@ class Messaging:
             if self.input_task:
                 self.input_task.cancel()
 
+    async def close(self):
+        try:
+            await self.input_task
+        except asyncio.CancelledError:
+            pass
+
 
 class Peer:
     def __init__(self, role):
         self.signaling = WebSocketSignaling("ws://152.53.123.174:8001")
         self.stop_event = asyncio.Event()
-        self.messaging = Messaging(stop_event=self.stop_event)
+        self.messaging = Messaging(self.stop_event, self.shutdown)
 
         ice_servers = [RTCIceServer(urls="stun:stun.l.google.com:19302")]
         rtc_config = RTCConfiguration(iceServers=ice_servers)
@@ -102,6 +121,15 @@ class Peer:
 
     async def start(self):
         await self.coro
+
+    async def shutdown(self):
+        if self.pc and self.pc.connectionState != "closed":
+            await self.pc.close()
+        if self.signaling:
+            await self.signaling.close()
+        if self.messaging:
+            await self.messaging.close()
+        self.stop_event.set()
 
     async def consume_signaling(self):
         """
@@ -123,8 +151,7 @@ class Peer:
         except asyncio.CancelledError:
             pass
         finally:
-            await self.pc.close()
-            await self.signaling.close()
+            await self.shutdown()
 
     async def run_answer(self):
         """
@@ -177,19 +204,4 @@ if __name__ == "__main__":
     if args.verbose:
         logging.basicConfig(level=logging.DEBUG)
 
-    # loop = asyncio.new_event_loop()
-    # asyncio.set_event_loop(loop)
     asyncio.run(main())
-    # try:
-    #     loop.run_until_complete(main_task)
-    # except KeyboardInterrupt:
-    #     messaging.stop_event.set()
-    #     if messaging.input_task:
-    #         messaging.input_task.cancel()
-    #     loop.run_until_complete(main_task)
-    # finally:
-    #     if messaging.input_task:
-    #         messaging.input_task.cancel()
-    #     loop.run_until_complete(pc.close())
-    #     loop.run_until_complete(signaling.close())
-    #     loop.close()
