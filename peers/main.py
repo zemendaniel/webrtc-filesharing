@@ -115,6 +115,8 @@ class FileSender:
         if not self._control_channel or not self._file_channel or not self._file_path:
             print("[ERROR] Channels or file path not ready")
             return
+        while self._control_channel.readyState != "open":
+            await asyncio.sleep(0.1)
 
         metadata = self._construct_metadata(self._file_path)
         self._control_channel.send(ControlMessage.create_json("metadata", json.dumps(metadata)))
