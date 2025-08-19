@@ -53,7 +53,7 @@ class Messaging:
 
     @staticmethod
     def __on_chat_message(message: str):
-        print(f"<<< {message}\n")
+        print(f"<<< {message}")
 
     async def __input_loop(self):
         print("Type message to send or /close to close the channel")
@@ -81,6 +81,8 @@ class Messaging:
         if message == "close":
             print("[Peer is disconnecting]")
             self.stop_event.set()
+            if self.input_task:
+                self.input_task.cancel()
 
 
 class Peer:
