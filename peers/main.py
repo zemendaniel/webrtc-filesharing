@@ -62,8 +62,8 @@ class Messaging:
                 msg = await aioconsole.ainput(">>> ")
                 if msg == "/close":
                     if self.control_channel.readyState == "open":
-                        await self.control_channel.send("close")
-                    await self.chat_channel.close()
+                        self.control_channel.send("close")
+                    self.chat_channel.close()
                     print("[You have closed the channel]")
                     self.stop_event.set()
                     break
