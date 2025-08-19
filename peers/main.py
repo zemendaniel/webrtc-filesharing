@@ -1,3 +1,6 @@
+import aiofiles
+import json
+import os
 import asyncio
 import sys
 import argparse
@@ -8,177 +11,230 @@ import pickle
 from aiortc import RTCIceCandidate, RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer
 from aiortc.contrib.signaling import BYE, add_signaling_arguments, create_signaling
 import aioconsole
+import hashlib
+
+CHUNK_SIZE = 16 * 1024
 
 
 class WebSocketSignaling:
     def __init__(self, uri):
-        self.uri = uri
-        self.ws = None
+        self._uri = uri
+        self._ws = None
 
     async def connect(self):
         import websockets
-        self.ws = await websockets.connect(self.uri)
+        self._ws = await websockets.connect(self._uri)
 
     async def send(self, message):
-        await self.ws.send(pickle.dumps(message))
+        await self._ws.send(pickle.dumps(message))
 
     async def receive(self):
-        data = await self.ws.recv()
+        data = await self._ws.recv()
         return pickle.loads(data)
 
     async def close(self):
-        await self.ws.close()
+        await self._ws.close()
 
 
-class Messaging:
-    def __init__(self, stop_event, on_close):
-        self.chat_channel = None
-        self.control_channel = None
-        self.input_task = None
-        self.stop_event = stop_event
-        self.on_close = on_close
-
-    def set_on_close(self, on_close):
-        self.on_close = on_close
-
-    def set_channel(self, channel_type, channel):
-        if channel_type == "chat":
-            self.chat_channel = channel
-        elif channel_type == "control":
-            self.control_channel = channel
-
-        if not (self.control_channel and self.chat_channel):
-            return
-
-        self.chat_channel.on("message", lambda msg: Messaging.__on_chat_message(msg))
-        self.control_channel.on("message", lambda msg: self.__on_control_message(msg))
-
-        if self.chat_channel.readyState == "open":
-            self.input_task = asyncio.create_task(self.__input_loop())
-        else:
-            self.chat_channel.on("open", self.__on_chat_open)
-
-    def __on_chat_open(self):
-        if not self.input_task:
-            self.input_task = asyncio.create_task(self.__input_loop())
+class ControlMessage:
+    def __init__(self, msg_type, data):
+        self.msg_type = msg_type
+        self.data = data
 
     @staticmethod
-    def __on_chat_message(message: str):
-        print(f"<<< {message}")
+    def create_json(msg_type, data):
+        return json.dumps({
+            "type": msg_type,
+            "data": data
+        })
 
-    async def __input_loop(self):
-        print("Type message to send or /close to close the channel")
-        try:
-            while not self.stop_event.is_set():
-                msg = await aioconsole.ainput(">>> ")
-                if msg == "/close":
-                    if self.control_channel.readyState == "open":
-                        self.control_channel.send("close")
-                    self.chat_channel.close()
-                    print("[You have closed the channel]")
-                    self.stop_event.set()
+    @staticmethod
+    def from_json(data):
+        parsed = json.loads(data)
+        match parsed["type"]:
+            case "metadata":
+                return ControlMessage(parsed["type"], json.loads(parsed["data"]))
+            case _:
+                return ControlMessage(parsed["type"], parsed["data"])
+
+
+class Progress:
+    def __init__(self, total):
+        self.total = total
+        self.current = 0
+        self._last_print = 0
+
+    def update(self, data):
+        self.current += len(data)
+        now = time.time()
+        if now - self._last_print >= 1:  # print at most once per second
+            percent = (self.current / self.total) * 100
+            print(f"Progress: {self.current}/{self.total} bytes ({percent:.2f}%)")
+            self._last_print = now
+
+
+def compute_hash(file_path):
+    sha = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        while chunk := f.read(CHUNK_SIZE):
+            sha.update(chunk)
+    return sha.hexdigest()
+
+
+class FileSender:
+    def __init__(self):
+        self._file_channel = None
+        self._control_channel = None
+
+    def set_channel(self, channel_type, channel):
+        if channel_type == "file":
+            self._file_channel = channel
+        elif channel_type == "control":
+            self._control_channel = channel
+
+    @staticmethod
+    def _construct_metadata(file_path):
+        metadata = {
+            "file_name": os.path.basename(file_path),
+            "file_size": os.path.getsize(file_path),
+            "hash": compute_hash(file_path)
+        }
+        return metadata
+
+    async def start_sending(self, file_path):
+        metadata = self._construct_metadata(file_path)
+        self._control_channel.send(ControlMessage.create_json("metadata", json.dumps(metadata)))
+
+        progress = Progress(metadata["file_size"])
+
+        async with aiofiles.open(file_path, "rb") as fp:
+            while True:
+                chunk = await fp.read(CHUNK_SIZE)
+                if not chunk:
                     break
 
-                if self.chat_channel.readyState == "open":
-                    self.chat_channel.send(msg)
+                while self._file_channel.bufferedAmount > 4 * CHUNK_SIZE:
+                    await asyncio.sleep(0)
+
+                self._file_channel.send(chunk)
+                progress.update(chunk)
+
+        self._control_channel.send(ControlMessage.create_json("eof", metadata["file_name"]))
+        
+
+class FileReceiver:
+    def __init__(self, path):
+        self._file_channel = None
+        self._control_channel = None
+        self._metadata = None
+        self._location = None
+        self._file_obj = None
+        self._progress = None
+        self._path = path
+
+    def set_channel(self, channel_type, channel):
+        if channel_type == "file":
+            self._file_channel = channel
+            self._file_channel.on("message", lambda message: self._on_file_chunk(message))
+        elif channel_type == "control":
+            self._control_channel = channel
+            self._control_channel.on("message", lambda message: self._on_control_message(message))
+
+    def set_path(self, path):
+        self._path = path
+
+    async def _on_file_chunk(self, chunk):
+        if not self._file_obj:
+            if not self._metadata or not self._path:
+                print("[ERROR] Metadata or path not set before receiving file")
+                return
+
+            self._file_obj = await aiofiles.open(self._location, "wb")
+            self._progress = Progress(self._metadata["file_size"])
+            print(f"Receiving file: {self._metadata['file_name']} ({self._metadata['file_size']} bytes)")
+
+        try:
+            await self._file_obj.write(chunk)
+            self._progress.update(chunk)
+        except Exception as e:
+            await self._file_obj.close()
+            self._file_obj = None
+            raise e
+
+    async def _on_control_message(self, message):
+        control_message = ControlMessage.from_json(message)
+        match control_message.msg_type:
+            case "metadata":
+                self._metadata = control_message.data
+                self._location = os.path.join(self._path, self._metadata["file_name"])
+            case "eof":
+                if self._file_obj:
+                    await self._file_obj.close()
+                    self._file_obj = None
+                if compute_hash(self._path) == self._metadata["hash"]:
+                    print("File received successfully")
                 else:
-                    print("[The chanel got disconnected]")
-                    self.stop_event.set()
-                    if self.on_close:
-                        await self.on_close()
-                    break
-        except asyncio.CancelledError:
-            pass
-
-    def __on_control_message(self, message):
-        if message == "close":
-            print("[Peer is disconnecting]")
-            self.stop_event.set()
-            if self.input_task:
-                self.input_task.cancel()
-
-    async def close(self):
-        try:
-            await self.input_task
-        except asyncio.CancelledError:
-            pass
-
+                    print("[ERROR} File corrupted")
+        
 
 class Peer:
     def __init__(self, role):
         self.signaling = WebSocketSignaling("ws://152.53.123.174:8001")
-        self.stop_event = asyncio.Event()
-        self.messaging = Messaging(self.stop_event, self.shutdown)
-
         ice_servers = [RTCIceServer(urls="stun:stun.l.google.com:19302")]
         rtc_config = RTCConfiguration(iceServers=ice_servers)
         self.pc = RTCPeerConnection(configuration=rtc_config)
 
         if role == "send":
+            self.file_handler = FileSender()
             self.coro = self.run_offer()
         elif role == "receive":
+            self.file_handler = FileReceiver(args.path)
             self.coro = self.run_answer()
 
     async def start(self):
         await self.coro
-
-    async def shutdown(self):
-        if self.pc and self.pc.connectionState != "closed":
-            await self.pc.close()
-        if self.signaling:
-            await self.signaling.close()
-        if self.messaging:
-            await self.messaging.close()
-        self.stop_event.set()
+        if isinstance(self.file_handler, FileSender):
+            await self.file_handler.start_sending(args.path)
 
     async def consume_signaling(self):
-        """
-        The main loop of the peer
-        """
-        try:
-            while not self.stop_event.is_set():
-                obj = await self.signaling.receive()
+        obj = await self.signaling.receive()
 
-                if isinstance(obj, RTCSessionDescription):
-                    await self.pc.setRemoteDescription(obj)
+        if isinstance(obj, RTCSessionDescription):
+            await self.pc.setRemoteDescription(obj)
 
-                    if obj.type == "offer":
-                        await self.pc.setLocalDescription(await self.pc.createAnswer())
-                        await self.signaling.send(self.pc.localDescription)
+            if obj.type == "offer":
+                await self.pc.setLocalDescription(await self.pc.createAnswer())
+                await self.signaling.send(self.pc.localDescription)
 
-                elif isinstance(obj, RTCIceCandidate):
-                    await self.pc.addIceCandidate(obj)
-        except asyncio.CancelledError:
-            pass
-        finally:
-            await self.shutdown()
+        elif isinstance(obj, RTCIceCandidate):
+            await self.pc.addIceCandidate(obj)
 
     async def run_answer(self):
         """
-        The receiver uses this function to receive the offer from the signaling server and start the loop
+        The receiver uses this function to receive the offer from the signaling server
         """
         await self.signaling.connect()
 
         @self.pc.on("datachannel")
         def on_datachannel(channel):
-            if channel.label == "chat":
-                self.messaging.set_channel("chat", channel)
+            if channel.label == "file":
+                self.file_handler.set_channel("file", channel)
             elif channel.label == "control":
-                self.messaging.set_channel("control", channel)
+                self.file_handler.set_channel("control", channel)
 
         await self.consume_signaling()
 
     async def run_offer(self):
         """
-        The sender uses this function to send the offer to the signaling server and start the loop
+        The sender uses this function to send the offer to the signaling server
         """
         await self.signaling.connect()
 
-        chat_channel = self.pc.createDataChannel("chat")
+        file_channel = self.pc.createDataChannel("file")
         control_channel = self.pc.createDataChannel("control")
 
-        self.messaging.set_channel("chat", chat_channel)
-        self.messaging.set_channel("control", control_channel)
+        self.file_handler.set_channel("file", file_channel)
+        self.file_handler.set_channel("control", control_channel)
 
         await self.pc.setLocalDescription(await self.pc.createOffer())
         await self.signaling.send(self.pc.localDescription)
@@ -197,7 +253,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Data channel file transfer")
     parser.add_argument("role", choices=["send", "receive"])
-    parser.add_argument("--verbose", "-v", action="count")
+    parser.add_argument("path")
 
     args = parser.parse_args()
 
