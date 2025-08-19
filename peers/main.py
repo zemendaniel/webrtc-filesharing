@@ -85,10 +85,12 @@ class FileSender:
     def __init__(self):
         self._file_channel = None
         self._control_channel = None
+        self._file_path = None
 
     def set_channel(self, channel_type, channel):
         if channel_type == "file":
             self._file_channel = channel
+            self._file_channel.on("open", lambda: asyncio.create_task(self._start_file_transfer()))
         elif channel_type == "control":
             self._control_channel = channel
 
@@ -101,13 +103,20 @@ class FileSender:
         }
         return metadata
 
-    async def start_sending(self, file_path):
-        metadata = self._construct_metadata(file_path)
+    def start_sending(self, file_path):
+        self._file_path = file_path
+
+    async def _start_file_transfer(self):
+        if not self._control_channel or not self._file_channel or not self._file_path:
+            print("[ERROR] Channels or file path not ready")
+            return
+
+        metadata = self._construct_metadata(self._file_path)
         self._control_channel.send(ControlMessage.create_json("metadata", json.dumps(metadata)))
 
         progress = Progress(metadata["file_size"])
 
-        async with aiofiles.open(file_path, "rb") as fp:
+        async with aiofiles.open(self._file_path, "rb") as fp:
             while True:
                 chunk = await fp.read(CHUNK_SIZE)
                 if not chunk:
@@ -120,7 +129,7 @@ class FileSender:
                 progress.update(chunk)
 
         self._control_channel.send(ControlMessage.create_json("eof", metadata["file_name"]))
-        
+
 
 class FileReceiver:
     def __init__(self, path):
@@ -194,7 +203,7 @@ class Peer:
     async def start(self):
         await self.coro
         if isinstance(self.file_handler, FileSender):
-            await self.file_handler.start_sending(args.path)
+            self.file_handler.start_sending(args.path)
 
     async def consume_signaling(self):
         obj = await self.signaling.receive()
