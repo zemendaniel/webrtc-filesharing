@@ -7,7 +7,6 @@ import time
 import pickle
 from aiortc import RTCIceCandidate, RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer
 from aiortc.contrib.signaling import BYE, add_signaling_arguments, create_signaling
-import threading
 
 
 class WebSocketSignaling:
@@ -35,6 +34,7 @@ class Messaging:
         self.chat_channel = None
         self.control_channel = None
         self.input_task = None
+        self.stop_event = asyncio.Event()
 
     def set_channel(self, channel_type, channel):
         if channel_type == "chat":
@@ -46,12 +46,13 @@ class Messaging:
             return
 
         self.chat_channel.on("message", lambda msg: Messaging.__on_chat_message(msg))
-        self.control_channel.on("message", lambda msg: Messaging.__on_control_message(msg))
+        self.control_channel.on("message", lambda msg: self.__on_control_message(msg))
 
         if self.chat_channel.readyState == "open":
             self.input_task = asyncio.create_task(self.input_loop())
         else:
             self.chat_channel.on("open", self.__on_chat_open)
+
     @staticmethod
     def __on_chat_message(message: str):
         print(f"<<< {message}")
@@ -62,42 +63,51 @@ class Messaging:
 
     async def input_loop(self):
         loop = asyncio.get_running_loop()
-        while True:
-            msg = await loop.run_in_executor(None, input, ">>> ")
-            if msg == "/close":
-                if self.control_channel.readyState == "open":
-                    self.control_channel.send("close")
-                self.chat_channel.close()
-                print("[You have closed the channel]")
-                break
+        try:
+            while not self.stop_event.is_set():
+                msg = await loop.run_in_executor(None, input, ">>> ")
+                if msg == "/close":
+                    if self.control_channel.readyState == "open":
+                        self.control_channel.send("close")
+                    self.chat_channel.close()
+                    print("[You have closed the channel]")
+                    self.stop_event.set()
+                    break
 
-            if self.chat_channel.readyState == "open":
-                self.chat_channel.send(msg)
-            else:
-                print("[The peer has closed the channel]")
-    @staticmethod
-    def __on_control_message(message):
+                if self.chat_channel.readyState == "open":
+                    self.chat_channel.send(msg)
+                else:
+                    print("[The chanel got disconnected]")
+                    self.stop_event.set()
+                    break
+        except asyncio.CancelledError:
+            pass
+
+    def __on_control_message(self, message):
         if message == "close":
             print("[Peer is disconnecting]")
+            self.stop_event.set()
 
 
 async def consume_signaling(pc, signaling):
-    while True:
-        obj = await signaling.receive()
+    try:
+        while True:
+            obj = await signaling.receive()
 
-        if isinstance(obj, RTCSessionDescription):
-            await pc.setRemoteDescription(obj)
+            if isinstance(obj, RTCSessionDescription):
+                await pc.setRemoteDescription(obj)
 
-            if obj.type == "offer":
-                await pc.setLocalDescription(await pc.createAnswer())
-                await signaling.send(pc.localDescription)
+                if obj.type == "offer":
+                    await pc.setLocalDescription(await pc.createAnswer())
+                    await signaling.send(pc.localDescription)
 
-        elif isinstance(obj, RTCIceCandidate):
-            await pc.addIceCandidate(obj)
-
-        elif obj is BYE:
-            print("[Signaling received BYE, exiting]")
-            break
+            elif isinstance(obj, RTCIceCandidate):
+                await pc.addIceCandidate(obj)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        await pc.close()
+        await signaling.close()
 
 
 async def run_answer(pc, signaling):
@@ -117,11 +127,9 @@ async def run_offer(pc, signaling):
     global messaging
     await signaling.connect()
 
-    # create channels
     chat_channel = pc.createDataChannel("chat")
     control_channel = pc.createDataChannel("control")
 
-    # assign channels to messaging
     messaging.set_channel("chat", chat_channel)
     messaging.set_channel("control", control_channel)
 
@@ -132,37 +140,45 @@ async def run_offer(pc, signaling):
     await consume_signaling(pc, signaling)
 
 
+async def main():
+    if args.role == "send":
+        await run_offer(pc, signaling)
+    elif args.role == "receive":
+        await run_answer(pc, signaling)
+
+
 if __name__ == "__main__":
     if sys.platform.startswith("win"):
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
     parser = argparse.ArgumentParser(description="Data channel file transfer")
     parser.add_argument("role", choices=["send", "receive"])
-    # parser.add_argument("filename")
     parser.add_argument("--verbose", "-v", action="count")
+
     args = parser.parse_args()
 
     if args.verbose:
         logging.basicConfig(level=logging.DEBUG)
 
-    signaling = WebSocketSignaling("ws://127.0.0.1:8001")
+    signaling = WebSocketSignaling("ws://152.53.123.174:8001")
     ice_servers = [RTCIceServer(urls="stun:stun.l.google.com:19302")]
     rtc_config = RTCConfiguration(iceServers=ice_servers)
     pc = RTCPeerConnection(configuration=rtc_config)
     messaging = Messaging()
-    if args.role == "send":
-        coro = run_offer(pc, signaling)
-    else:
-        coro = run_answer(pc, signaling)
 
-    # run event loop
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    main_task = loop.create_task(main())
     try:
-        loop.run_until_complete(coro)
+        loop.run_until_complete(main_task)
     except KeyboardInterrupt:
-        pass
+        messaging.stop_event.set()
+        if messaging.input_task:
+            messaging.input_task.cancel()
+        loop.run_until_complete(main_task)
     finally:
         if messaging.input_task:
             messaging.input_task.cancel()
         loop.run_until_complete(pc.close())
         loop.run_until_complete(signaling.close())
+        loop.close()
