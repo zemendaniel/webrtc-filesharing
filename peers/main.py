@@ -120,26 +120,23 @@ class FileSender:
 
         metadata = self._construct_metadata(self._file_path)
         self._control_channel.send(ControlMessage.create_json("metadata", json.dumps(metadata)))
+        await asyncio.sleep(0)
 
         progress = Progress(metadata["file_size"])
 
         async with aiofiles.open(self._file_path, "rb") as fp:
-            # # # while True:
-            # # #     chunk = await fp.read(CHUNK_SIZE)
-            # # #     if not chunk:
-            # # #         break
-            # # #
-            # # #     while self._file_channel.bufferedAmount > 4 * CHUNK_SIZE:
-            # # #         await asyncio.sleep(0)
-            # #
-            # #     self._file_channel.send(chunk)
-            #     progress.update(chunk)
-            file = await fp.read()
-            self._file_channel.send(file)
+            while chunk := await fp.read(CHUNK_SIZE):
+                while self._file_channel.bufferedAmount > 4 * CHUNK_SIZE:
+                    await asyncio.sleep(0)
+
+                self._file_channel.send(chunk)
+                progress.update(chunk)
+                await asyncio.sleep(0)
 
         self._control_channel.send(ControlMessage.create_json("eof", metadata["file_name"]))
 
-        self._done.set_result(None)
+        if not self._done.done():
+            self._done.set_result(None)
 
 
 class FileReceiver:
@@ -192,7 +189,11 @@ class FileReceiver:
                 if self._file_obj:
                     await self._file_obj.close()
                     self._file_obj = None
-                if compute_hash(self._location) == self._metadata["hash"]:
+                expected_hash = compute_hash(self._location)
+                actual_hash = self._metadata["hash"]
+                print(f"Expected hash: {expected_hash} {type(expected_hash)}")
+                print(f"Actual hash: {actual_hash} {type(actual_hash)}")
+                if expected_hash == actual_hash:
                     print("File received successfully")
                 else:
                     print("[ERROR} File corrupted")
