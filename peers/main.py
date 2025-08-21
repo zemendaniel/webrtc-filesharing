@@ -87,6 +87,7 @@ class FileSender:
         self._file_channel = None
         self._control_channel = None
         self._sending_task = None
+        self._done = asyncio.Future()
 
     def set_channel(self, channel_type, channel):
         if channel_type == "file":
@@ -101,7 +102,7 @@ class FileSender:
             self._sending_task = asyncio.create_task(self._start_file_transfer())
 
     async def wait_until_done(self):
-        await self._sending_task
+        await self._done
 
     @staticmethod
     def _construct_metadata(file_path):
@@ -133,9 +134,12 @@ class FileSender:
             # #
             # #     self._file_channel.send(chunk)
             #     progress.update(chunk)
-            self._file_channel.send(fp.read())
+            file = await fp.read()
+            self._file_channel.send(file)
 
         self._control_channel.send(ControlMessage.create_json("eof", metadata["file_name"]))
+
+        self._done.set_result(None)
 
 
 class FileReceiver:
@@ -147,10 +151,10 @@ class FileReceiver:
         self._file_obj = None
         self._progress = None
         self._path = path
-        self._future = asyncio.Future()
+        self._done = asyncio.Future()
 
     async def wait_until_done(self):
-        await self._future
+        await self._done
 
     def set_channel(self, channel_type, channel):
         if channel_type == "file":
@@ -192,7 +196,7 @@ class FileReceiver:
                     print("File received successfully")
                 else:
                     print("[ERROR} File corrupted")
-                self._future.set_result(None)
+                self._done.set_result(None)
         
 
 class Peer:
