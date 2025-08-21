@@ -13,7 +13,8 @@ from aiortc.contrib.signaling import BYE, add_signaling_arguments, create_signal
 import aioconsole
 import hashlib
 
-CHUNK_SIZE = 16 * 1024
+CHUNK_SIZE = 256 * 1024
+MAX_BUFFERED_AMOUNT = 4 * CHUNK_SIZE
 
 
 class WebSocketSignaling:
@@ -88,11 +89,14 @@ class FileSender:
         self._control_channel = None
         self._sending_task = None
         self._done = asyncio.Future()
+        self._buffer_event = asyncio.Event()
+        self._buffer_event.set()
 
     def set_channel(self, channel_type, channel):
         if channel_type == "file":
             self._file_channel = channel
             self._file_channel.on("open", self._on_both_channels_open)
+            self._file_channel.on("bufferedamountlow", self._on_buffered_amount_low)
         elif channel_type == "control":
             self._control_channel = channel
             self._control_channel.on("open", self._on_both_channels_open)
@@ -110,6 +114,10 @@ class FileSender:
                 self._done.set_result(None)
                 self._file_channel.close()
                 self._control_channel.close()
+
+    def _on_buffered_amount_low(self):
+        if self._buffer_event.is_set() is False:
+            self._buffer_event.set()
 
     async def wait_until_done(self):
         await self._done
@@ -137,8 +145,10 @@ class FileSender:
         async with aiofiles.open(self._file_path, "rb") as fp:
             while chunk := await fp.read(CHUNK_SIZE):
                 chunk = bytes(chunk)
-                while self._file_channel.bufferedAmount > 4 * CHUNK_SIZE:
-                    await asyncio.sleep(0)
+                while self._file_channel.bufferedAmount > MAX_BUFFERED_AMOUNT:
+                    print("Buffered amount too high, waiting...")
+                    self._buffer_event.clear()
+                    await self._buffer_event.wait()
 
                 self._file_channel.send(chunk)
                 progress.update(chunk)
@@ -190,6 +200,7 @@ class FileReceiver:
             print("[ERROR] File corrupted")
         else:
             print("File received successfully")
+        # todo success or not
         self._control_channel.send(ControlMessage.create_json("transfer_complete", self._metadata["file_name"]))
 
         self._done.set_result(None)
