@@ -132,7 +132,6 @@ class FileSender:
 
                 self._file_channel.send(chunk)
                 progress.update(chunk)
-                await asyncio.sleep(0)
 
         self._control_channel.send(ControlMessage.create_json("eof", metadata["file_name"]))
 
@@ -150,6 +149,7 @@ class FileReceiver:
         self._progress = None
         self._path = path
         self._done = asyncio.Future()
+        self._write_lock = asyncio.Lock()
 
     async def wait_until_done(self):
         await self._done
@@ -163,24 +163,26 @@ class FileReceiver:
             self._control_channel.on("message", lambda message: asyncio.create_task(self._on_control_message(message)))
 
     async def _on_file_chunk(self, chunk):
-        if not self._file_obj:
-            if not self._metadata or not self._path:
-                print("[ERROR] Metadata or path not set before receiving file")
-                return
+        async with self._write_lock:
+            if not self._file_obj:
+                if not self._metadata or not self._path:
+                    print("[ERROR] Metadata or path not set before receiving file")
+                    return
 
-            self._file_obj = await aiofiles.open(self._location, "wb")
-            self._progress = Progress(self._metadata["file_size"])
-            print(f"Receiving file: {self._metadata['file_name']} ({self._metadata['file_size']} bytes)")
+                self._file_obj = await aiofiles.open(self._location, "wb")
+                self._progress = Progress(self._metadata["file_size"])
+                print(f"Receiving file: {self._metadata['file_name']} ({self._metadata['file_size']} bytes)")
 
-        try:
-            if isinstance(chunk, str):
-                chunk = chunk.encode()
-            await self._file_obj.write(chunk)
-            self._progress.update(chunk)
-        except Exception as e:
-            await self._file_obj.close()
-            self._file_obj = None
-            raise e
+            try:
+                if not isinstance(chunk, (bytes, bytearray)):
+                    raise ValueError(f"Expected bytes but got {type(chunk)}")
+
+                await self._file_obj.write(chunk)
+                self._progress.update(chunk)
+            except Exception as e:
+                await self._file_obj.close()
+                self._file_obj = None
+                raise e
 
     async def _on_control_message(self, message):
         control_message = ControlMessage.from_json(message)
@@ -189,18 +191,19 @@ class FileReceiver:
                 self._metadata = control_message.data
                 self._location = os.path.join(self._path, self._metadata["file_name"])
             case "eof":
-                if self._file_obj:
-                    await self._file_obj.close()
-                    self._file_obj = None
-                expected_hash = compute_hash(self._location)
-                actual_hash = self._metadata["hash"]
-                print(f"Expected hash: {expected_hash} {type(expected_hash)}")
-                print(f"Actual hash: {actual_hash} {type(actual_hash)}")
-                if expected_hash == actual_hash:
-                    print("File received successfully")
-                else:
-                    print("[ERROR} File corrupted")
-                self._done.set_result(None)
+                async with self._write_lock:
+                    if self._file_obj:
+                        await self._file_obj.close()
+                        self._file_obj = None
+                    expected_hash = compute_hash(self._location)
+                    actual_hash = self._metadata["hash"]
+                    print(f"Expected hash: {expected_hash} {type(expected_hash)}")
+                    print(f"Actual hash: {actual_hash} {type(actual_hash)}")
+                    if expected_hash == actual_hash:
+                        print("File received successfully")
+                    else:
+                        print("[ERROR} File corrupted")
+                    self._done.set_result(None)
         
 
 class Peer:
