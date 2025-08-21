@@ -126,6 +126,7 @@ class FileSender:
 
         async with aiofiles.open(self._file_path, "rb") as fp:
             while chunk := await fp.read(CHUNK_SIZE):
+                chunk = bytes(chunk)
                 while self._file_channel.bufferedAmount > 4 * CHUNK_SIZE:
                     await asyncio.sleep(0)
 
@@ -172,6 +173,8 @@ class FileReceiver:
             print(f"Receiving file: {self._metadata['file_name']} ({self._metadata['file_size']} bytes)")
 
         try:
+            if isinstance(chunk, str):
+                chunk = chunk.encode()
             await self._file_obj.write(chunk)
             self._progress.update(chunk)
         except Exception as e:
@@ -217,11 +220,10 @@ class Peer:
 
     async def start(self):
         await self.coro
-        # if self.role == "send":
-        #     print("Waiting for file transfer to finish...")
-        #     await self.file_handler.wait_until_done()
-        # elif self.role == "receive":
-        #     print("Waiting for file reception to finish...")
+        if self.role == "send":
+            print("Waiting for file transfer to finish...")
+        elif self.role == "receive":
+            print("Waiting for file reception to finish...")
         await self.file_handler.wait_until_done()
 
     async def consume_signaling(self):
