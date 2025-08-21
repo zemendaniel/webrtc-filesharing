@@ -268,10 +268,15 @@ class Peer:
 
         await self.consume_signaling()
 
+    async def close(self):
+        await self.signaling.close()
+        await self.pc.close()
+
 
 async def main():
     peer = Peer(args.role)
     await peer.start()
+    await peer.close()
 
 
 if __name__ == "__main__":
