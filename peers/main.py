@@ -96,10 +96,20 @@ class FileSender:
         elif channel_type == "control":
             self._control_channel = channel
             self._control_channel.on("open", self._on_both_channels_open)
+            self._control_channel.on("message", lambda message: asyncio.create_task(self._on_control_message(message)))
 
     def _on_both_channels_open(self):
         if self._file_channel.readyState == "open" and self._control_channel.readyState == "open":
             self._sending_task = asyncio.create_task(self._start_file_transfer())
+
+    async def _on_control_message(self, message):
+        control_message = ControlMessage.from_json(message)
+        match control_message.msg_type:
+            case "transfer_complete":
+                print(f"Receiver confirmed transfer complete: {control_message.data}")
+                self._done.set_result(None)
+                self._file_channel.close()
+                self._control_channel.close()
 
     async def wait_until_done(self):
         await self._done
@@ -135,9 +145,6 @@ class FileSender:
 
         self._control_channel.send(ControlMessage.create_json("eof", metadata["file_name"]))
 
-        if not self._done.done():
-            self._done.set_result(None)
-
 
 class FileReceiver:
     def __init__(self, path):
@@ -145,11 +152,12 @@ class FileReceiver:
         self._control_channel = None
         self._metadata = None
         self._location = None
-        self._file_obj = None
         self._progress = None
         self._path = path
         self._done = asyncio.Future()
-        self._write_lock = asyncio.Lock()
+        self._chunk_queue = asyncio.Queue()
+        self._eof_event = asyncio.Event()
+        self._writer_task = None
 
     async def wait_until_done(self):
         await self._done
@@ -157,32 +165,36 @@ class FileReceiver:
     def set_channel(self, channel_type, channel):
         if channel_type == "file":
             self._file_channel = channel
-            self._file_channel.on("message", lambda message: asyncio.create_task(self._on_file_chunk(message)))
+            self._file_channel.on("message", lambda message: self._chunk_queue.put_nowait(message))
         elif channel_type == "control":
             self._control_channel = channel
             self._control_channel.on("message", lambda message: asyncio.create_task(self._on_control_message(message)))
 
-    async def _on_file_chunk(self, chunk):
-        async with self._write_lock:
-            if not self._file_obj:
-                if not self._metadata or not self._path:
-                    print("[ERROR] Metadata or path not set before receiving file")
-                    return
+    async def _process_file(self):
+        if not self._metadata or not self._path:
+            print("[ERROR] Metadata or path not set before receiving file")
+            return
 
-                self._file_obj = await aiofiles.open(self._location, "wb")
-                self._progress = Progress(self._metadata["file_size"])
-                print(f"Receiving file: {self._metadata['file_name']} ({self._metadata['file_size']} bytes)")
-
-            try:
+        async with aiofiles.open(self._location, "wb") as f:
+            while True:
+                if self._chunk_queue.empty() and self._eof_event.is_set():
+                    break
+                chunk = await self._chunk_queue.get()
                 if not isinstance(chunk, (bytes, bytearray)):
                     raise ValueError(f"Expected bytes but got {type(chunk)}")
 
-                await self._file_obj.write(chunk)
+                await f.write(chunk)
                 self._progress.update(chunk)
-            except Exception as e:
-                await self._file_obj.close()
-                self._file_obj = None
-                raise e
+
+        if compute_hash(self._location) != self._metadata["hash"]:
+            print("[ERROR] File corrupted")
+        else:
+            print("File received successfully")
+        self._control_channel.send(ControlMessage.create_json("transfer_complete", self._metadata["file_name"]))
+
+        self._done.set_result(None)
+        self._file_channel.close()
+        self._control_channel.close()
 
     async def _on_control_message(self, message):
         control_message = ControlMessage.from_json(message)
@@ -190,93 +202,84 @@ class FileReceiver:
             case "metadata":
                 self._metadata = control_message.data
                 self._location = os.path.join(self._path, self._metadata["file_name"])
+                self._progress = Progress(self._metadata["file_size"])
+                self._writer_task = asyncio.create_task(self._process_file())
+                print(f"Receiving file: {self._metadata['file_name']} ({self._metadata['file_size']} bytes)")
             case "eof":
-                async with self._write_lock:
-                    if self._file_obj:
-                        await self._file_obj.close()
-                        self._file_obj = None
-                    expected_hash = compute_hash(self._location)
-                    actual_hash = self._metadata["hash"]
-                    print(f"Expected hash: {expected_hash} {type(expected_hash)}")
-                    print(f"Actual hash: {actual_hash} {type(actual_hash)}")
-                    if expected_hash == actual_hash:
-                        print("File received successfully")
-                    else:
-                        print("[ERROR} File corrupted")
-                    self._done.set_result(None)
-        
+                self._eof_event.set()
+
 
 class Peer:
     def __init__(self, role):
-        self.signaling = WebSocketSignaling("ws://152.53.123.174:8001")
+        self._signaling = WebSocketSignaling("ws://152.53.123.174:8001")
         ice_servers = [RTCIceServer(urls="stun:stun.l.google.com:19302")]
         rtc_config = RTCConfiguration(iceServers=ice_servers)
-        self.pc = RTCPeerConnection(configuration=rtc_config)
-        self.role = role
+        self._pc = RTCPeerConnection(configuration=rtc_config)
+        self._role = role
 
         if role == "send":
-            self.file_handler = FileSender(args.path)
-            self.coro = self.run_offer()
+            self._file_handler = FileSender(args.path)
+            self._coro = self._run_offer()
         elif role == "receive":
-            self.file_handler = FileReceiver(args.path)
-            self.coro = self.run_answer()
+            self._file_handler = FileReceiver(args.path)
+            self._coro = self._run_answer()
 
     async def start(self):
-        await self.coro
-        if self.role == "send":
+        await self._coro
+        if self._role == "send":
             print("Waiting for file transfer to finish...")
-        elif self.role == "receive":
+        elif self._role == "receive":
             print("Waiting for file reception to finish...")
-        await self.file_handler.wait_until_done()
+        await self._file_handler.wait_until_done()
 
-    async def consume_signaling(self):
-        obj = await self.signaling.receive()
+    async def _consume_signaling(self):
+        obj = await self._signaling.receive()
 
         if isinstance(obj, RTCSessionDescription):
-            await self.pc.setRemoteDescription(obj)
+            await self._pc.setRemoteDescription(obj)
 
             if obj.type == "offer":
-                await self.pc.setLocalDescription(await self.pc.createAnswer())
-                await self.signaling.send(self.pc.localDescription)
+                await self._pc.setLocalDescription(await self._pc.createAnswer())
+                await self._signaling.send(self._pc.localDescription)
 
         elif isinstance(obj, RTCIceCandidate):
-            await self.pc.addIceCandidate(obj)
+            await self._pc.addIceCandidate(obj)
 
-    async def run_answer(self):
+    async def _run_answer(self):
         """
         The receiver uses this function to receive the offer from the signaling server
         """
-        await self.signaling.connect()
+        await self._signaling.connect()
 
-        @self.pc.on("datachannel")
-        def on_datachannel(channel):
+        @self._pc.on("datachannel")
+        def _on_datachannel(channel):
             if channel.label == "file":
-                self.file_handler.set_channel("file", channel)
+                self._file_handler.set_channel("file", channel)
             elif channel.label == "control":
-                self.file_handler.set_channel("control", channel)
+                self._file_handler.set_channel("control", channel)
 
-        await self.consume_signaling()
+        await self._consume_signaling()
 
-    async def run_offer(self):
+    async def _run_offer(self):
         """
         The sender uses this function to send the offer to the signaling server
         """
-        await self.signaling.connect()
+        await self._signaling.connect()
 
-        file_channel = self.pc.createDataChannel("file")
-        control_channel = self.pc.createDataChannel("control")
+        file_channel = self._pc.createDataChannel("file")
+        control_channel = self._pc.createDataChannel("control")
 
-        self.file_handler.set_channel("file", file_channel)
-        self.file_handler.set_channel("control", control_channel)
+        self._file_handler.set_channel("file", file_channel)
+        self._file_handler.set_channel("control", control_channel)
 
-        await self.pc.setLocalDescription(await self.pc.createOffer())
-        await self.signaling.send(self.pc.localDescription)
+        await self._pc.setLocalDescription(await self._pc.createOffer())
+        await self._signaling.send(self._pc.localDescription)
 
-        await self.consume_signaling()
+        await self._consume_signaling()
 
     async def close(self):
-        await self.signaling.close()
-        await self.pc.close()
+        await self._signaling.close()
+        await self._pc.close()
 
 
 async def main():
