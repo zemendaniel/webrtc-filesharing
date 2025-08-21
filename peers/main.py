@@ -156,10 +156,10 @@ class FileReceiver:
     def set_channel(self, channel_type, channel):
         if channel_type == "file":
             self._file_channel = channel
-            self._file_channel.on("message", lambda message: self._on_file_chunk(message))
+            self._file_channel.on("message", lambda message: asyncio.create_task(self._on_file_chunk(message)))
         elif channel_type == "control":
             self._control_channel = channel
-            self._control_channel.on("message", lambda message: self._on_control_message(message))
+            self._control_channel.on("message", lambda message: asyncio.create_task(self._on_control_message(message)))
 
     async def _on_file_chunk(self, chunk):
         if not self._file_obj:
