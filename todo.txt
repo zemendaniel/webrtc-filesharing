@@ -1,0 +1,6 @@
+os threads instead of aiofiles
+hashing as reading/writing the chunks (using multiprocessing?)
+proper signaling with IDs etc.
+gui
+pause, resume later?
+cancel transfer

@@ -1,7 +1,6 @@
 import aiofiles
 import json
 import os
-import asyncio
 import sys
 import argparse
 import asyncio
@@ -9,12 +8,11 @@ import logging
 import time
 import pickle
 from aiortc import RTCIceCandidate, RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer
-from aiortc.contrib.signaling import BYE, add_signaling_arguments, create_signaling
-import aioconsole
 import hashlib
 
-CHUNK_SIZE = 256 * 1024
-MAX_BUFFERED_AMOUNT = 4 * CHUNK_SIZE
+CHUNK_SIZE = 128 * 1024
+# it represents the largest backlog you’re comfortable letting the channel reach before you stop pushing more chunks.
+MAX_BUFFERED_AMOUNT = 32 * CHUNK_SIZE
 
 
 class WebSocketSignaling:
@@ -64,14 +62,26 @@ class Progress:
         self.total = total
         self.current = 0
         self._last_print = 0
+        self._last_bytes = 0  # track how many bytes we had last time
 
     def update(self, data):
         self.current += len(data)
         now = time.time()
-        if now - self._last_print >= 1:  # print at most once per second
+
+        if now - self._last_print >= 1:  # update at most once per second
+            elapsed = now - self._last_print
+            bytes_since_last = self.current - self._last_bytes
+            speed_bps = bytes_since_last / elapsed  # bytes per second
+            speed_mbps = (speed_bps * 8) / 1e6     # convert to megabits/sec
+
             percent = (self.current / self.total) * 100
-            print(f"Progress: {self.current}/{self.total} bytes ({percent:.2f}%)")
+            print(
+                f"Progress: {self.current}/{self.total} bytes "
+                f"({percent:.2f}%) | Speed: {speed_mbps:.2f} Mb/s"
+            )
+
             self._last_print = now
+            self._last_bytes = self.current
 
 
 def compute_hash(file_path):
@@ -96,6 +106,7 @@ class FileSender:
         if channel_type == "file":
             self._file_channel = channel
             self._file_channel.on("open", self._on_both_channels_open)
+            self._file_channel.bufferedAmountLowThreshold = MAX_BUFFERED_AMOUNT
             self._file_channel.on("bufferedamountlow", self._on_buffered_amount_low)
         elif channel_type == "control":
             self._control_channel = channel
@@ -117,6 +128,7 @@ class FileSender:
 
     def _on_buffered_amount_low(self):
         if self._buffer_event.is_set() is False:
+            # print("Buffered amount too high, waiting...")
             self._buffer_event.set()
 
     async def wait_until_done(self):
@@ -146,7 +158,6 @@ class FileSender:
             while chunk := await fp.read(CHUNK_SIZE):
                 chunk = bytes(chunk)
                 while self._file_channel.bufferedAmount > MAX_BUFFERED_AMOUNT:
-                    print("Buffered amount too high, waiting...")
                     self._buffer_event.clear()
                     await self._buffer_event.wait()
 
